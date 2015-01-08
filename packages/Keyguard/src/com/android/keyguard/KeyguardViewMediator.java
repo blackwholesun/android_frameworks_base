@@ -114,9 +114,6 @@ public class KeyguardViewMediator {
     private static final String DELAYED_KEYGUARD_ACTION =
         "com.android.internal.policy.impl.PhoneWindowManager.DELAYED_KEYGUARD";
 
-    private static final String DISMISS_KEYGUARD_SECURELY_ACTION =
-            "com.android.keyguard.action.DISMISS_KEYGUARD_SECURELY";
-
     // used for handler messages
     private static final int SHOW = 2;
     private static final int HIDE = 3;
@@ -514,11 +511,7 @@ public class KeyguardViewMediator {
         mShowKeyguardWakeLock = mPM.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "show keyguard");
         mShowKeyguardWakeLock.setReferenceCounted(false);
 
-        mContext.registerReceiver(mBroadcastReceiver,
-                new IntentFilter(WindowManagerPolicy.ACTION_LID_STATE_CHANGED));
         mContext.registerReceiver(mBroadcastReceiver, new IntentFilter(DELAYED_KEYGUARD_ACTION));
-        mContext.registerReceiver(mBroadcastReceiver, new IntentFilter(DISMISS_KEYGUARD_SECURELY_ACTION),
-                android.Manifest.permission.CONTROL_KEYGUARD, null);
 
         mKeyguardDisplayManager = new KeyguardDisplayManager(context);
 
@@ -611,8 +604,11 @@ public class KeyguardViewMediator {
 
             mKeyguardDonePending = false;
 
-            // Lock immediately based on setting
-            final boolean lockImmediately = mLockPatternUtils.getPowerButtonInstantlyLocks();
+            // Lock immediately based on setting if secure (user has a pin/pattern/password).
+            // This also "locks" the device when not secure to provide easy access to the
+            // camera while preventing unwanted input.
+            final boolean lockImmediately =
+                mLockPatternUtils.getPowerButtonInstantlyLocks() || !mLockPatternUtils.isSecure();
 
             if (mExitSecureCallback != null) {
                 if (DEBUG) Log.d(TAG, "pending exit secure callback cancelled");
@@ -707,30 +703,13 @@ public class KeyguardViewMediator {
     }
 
     private void maybeSendUserPresentBroadcast() {
-        if (mSystemReady && isKeyguardDisabled()) {
-            // Keyguard can be showing even if disabled in case the SIM PIN entry
-            // screen is showing; so make sure to not send user present if it's
-            // actually showing
-            if (!mShowing && !mShowKeyguardWakeLock.isHeld()) {
-                sendUserPresentBroadcast();
-            }
+        if (mSystemReady && mLockPatternUtils.isLockScreenDisabled()
+                && mUserManager.getUsers(true).size() == 1) {
+            // Lock screen is disabled because the user has set the preference to "None".
+            // In this case, send out ACTION_USER_PRESENT here instead of in
+            // handleKeyguardDone()
+            sendUserPresentBroadcast();
         }
-    }
-
-    private boolean isKeyguardDisabled() {
-        if (!mExternallyEnabled) {
-            if (DEBUG) Log.d(TAG, "isKeyguardDisabled: keyguard is disabled externally");
-            return true;
-        }
-        if (mLockPatternUtils.isLockScreenDisabled() && mUserManager.getUsers(true).size() == 1) {
-            if (DEBUG) Log.d(TAG, "isKeyguardDisabled: keyguard is disabled by setting");
-            return true;
-        }
-        if (mLockPatternUtils.getActiveProfileLockMode() == Profile.LockMode.DISABLE) {
-            if (DEBUG) Log.d(TAG, "isKeyguardDisabled: keyguard is disabled by profile");
-            return true;
-        }
-        return false;
     }
 
     /**
@@ -923,15 +902,14 @@ public class KeyguardViewMediator {
         }
 
         // if the setup wizard hasn't run yet, don't show
+        final boolean requireSim = !SystemProperties.getBoolean("keyguard.no_require_sim",
+                false);
         final boolean provisioned = mUpdateMonitor.isDeviceProvisioned();
-        int numPhones = MSimTelephonyManager.getDefault().getPhoneCount();
-        final IccCardConstants.State []state = new IccCardConstants.State[numPhones];
-        boolean lockedOrMissing = false;
-        for (int i = 0; i < numPhones; i++) {
-            state[i] = mUpdateMonitor.getSimState(i);
-            lockedOrMissing = lockedOrMissing || isLockedOrMissing(state[i]);
-            if (lockedOrMissing) break;
-        }
+        final IccCardConstants.State state = mUpdateMonitor.getSimState();
+        final boolean lockedOrMissing = state.isPinLocked()
+                || ((state == IccCardConstants.State.ABSENT
+                || state == IccCardConstants.State.PERM_DISABLED)
+                && requireSim);
 
         if (!lockedOrMissing && !provisioned) {
             if (DEBUG) Log.d(TAG, "doKeyguard: not showing because device isn't provisioned"
@@ -939,22 +917,14 @@ public class KeyguardViewMediator {
             return;
         }
 
-        if (isKeyguardDisabled() && !lockedOrMissing) {
-            if (DEBUG) Log.d(TAG, "doKeyguard: not showing because disabled");
+        if (mUserManager.getUsers(true).size() < 2
+                && mLockPatternUtils.isLockScreenDisabled() && !lockedOrMissing) {
+            if (DEBUG) Log.d(TAG, "doKeyguard: not showing because lockscreen is off");
             return;
         }
 
         if (DEBUG) Log.d(TAG, "doKeyguard: showing the lock screen");
         showLocked(options);
-    }
-
-    boolean isLockedOrMissing(IccCardConstants.State state) {
-        final boolean requireSim = !SystemProperties.getBoolean("keyguard.no_require_sim",
-                false);
-        return (state.isPinLocked()
-                || ((state == IccCardConstants.State.ABSENT
-                        || state == IccCardConstants.State.PERM_DISABLED)
-                    && requireSim));
     }
 
     /**
@@ -1058,21 +1028,10 @@ public class KeyguardViewMediator {
                         + sequence + ", mDelayedShowingSequence = " + mDelayedShowingSequence);
                 synchronized (KeyguardViewMediator.this) {
                     if (mDelayedShowingSequence == sequence) {
+                        // Don't play lockscreen SFX if the screen went off due to timeout.
+                        mSuppressNextLockSound = true;
                         doKeyguardLocked(null);
                     }
-                }
-            } else if (WindowManagerPolicy.ACTION_LID_STATE_CHANGED.equals(intent.getAction())) {
-                final int state = intent.getIntExtra(WindowManagerPolicy.EXTRA_LID_STATE,
-                        WindowManagerPolicy.WindowManagerFuncs.LID_ABSENT);
-                synchronized (KeyguardViewMediator.this) {
-                    if(state != mLidState) {
-                        mLidState = state;
-                        mUpdateMonitor.dispatchLidStateChange(state);
-                    }
-                }
-            } else if (DISMISS_KEYGUARD_SECURELY_ACTION.equals(intent.getAction())) {
-                synchronized (KeyguardViewMediator.this) {
-                    dismiss();
                 }
             }
         }
