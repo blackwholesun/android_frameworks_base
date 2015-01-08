@@ -17,7 +17,6 @@
  */
 package com.android.keyguard;
 
-import android.app.Profile;
 import android.app.admin.DevicePolicyManager;
 import android.content.Context;
 import android.telephony.MSimTelephonyManager;
@@ -79,27 +78,14 @@ public class KeyguardSecurityModel {
 
     SecurityMode getSecurityMode() {
         KeyguardUpdateMonitor updateMonitor = KeyguardUpdateMonitor.getInstance(mContext);
-        IccCardConstants.State simState = updateMonitor.getSimState();
-
-        int numPhones = MSimTelephonyManager.getDefault().getPhoneCount();
-        for (int i = 0; i < numPhones; i++) {
-            simState = updateMonitor.getSimState(i);
-            // We are intereseted only in PIN_REQUIRED or PUK_REQUIRED
-            // So continue to the next sub if the sim state is other
-            // than these two.
-            if (simState == IccCardConstants.State.PIN_REQUIRED
-                    || simState == IccCardConstants.State.PUK_REQUIRED) {
-                break;
-            }
-        }
-
+        final IccCardConstants.State simState = updateMonitor.getSimState();
         SecurityMode mode = SecurityMode.None;
         if (simState == IccCardConstants.State.PIN_REQUIRED) {
             mode = SecurityMode.SimPin;
         } else if (simState == IccCardConstants.State.PUK_REQUIRED
                 && mLockPatternUtils.isPukUnlockScreenEnable()) {
             mode = SecurityMode.SimPuk;
-        } else if (mLockPatternUtils.getActiveProfileLockMode() != Profile.LockMode.INSECURE) {
+        } else {
             final int security = mLockPatternUtils.getKeyguardStoredPasswordQuality();
             switch (security) {
                 case DevicePolicyManager.PASSWORD_QUALITY_NUMERIC:
